@@ -1,0 +1,20 @@
+# Fichiers d'exploration / notes personnelles
+*.explc
+*.expl
+*.explh
+
+# Binaires compilés
+stub.bin
+packer.exe
+*.exe
+*.obj
+*.o
+*.pdb
+
+# Fichiers générés par NASM
+*.lst
+
+# Éditeurs
+*.swp
+*~
+.vscode/
