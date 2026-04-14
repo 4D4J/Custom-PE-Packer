@@ -14,7 +14,7 @@ ASmdead is a custom PE packer and memory execution tool designed to obscure exec
 To successfully spoof the call stack, ASmdead conforms to the strict Windows x64 calling convention. It manually crafts the stack frames in assembly (`ASM/stub.asm`), ensuring that the mandatory 32-byte shadow store (home space) and non-volatile registers are correctly preserved and aligned.
 
 <div align="center">
-  <img src="docs/pe_file_runtime_functions_stack.svg" alt="PE and Stack Architecture" width="300">
+  <img src="docs/pe_file_runtime_functions_stack.svg" alt="PE and Stack Architecture" width="550">
   <br><i>Typical x64 stack frame layout and mapping of RUNTIME_FUNCTION structures.</i>
 </div>
 
@@ -27,7 +27,7 @@ The core of the evasion involves a complex unwinding algorithm that sets up mult
 By bridging the actual execution through a JMP/ROP gadget (e.g., `JMP [RBX]`), the true payload execution is hidden. To an EDR analyzing the thread, the call tree appears entirely clean and sourced from legitimate Windows binaries.
 
 <div align="center">
-  <img src="docs/stack_spoof_call_chain.svg" alt="Call Stack Spoofing Algorithm" width="300">
+  <img src="docs/stack_spoof_call_chain.svg" alt="Call Stack Spoofing Algorithm" width="650">
   <br><i>Call Stack Spoofing Architecture: Setting up fake frames, pivoting the stack, and handling the unwinding algorithm.</i>
 </div>
 
