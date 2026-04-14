@@ -4,14 +4,14 @@ default rel
 config_magic:        dq 0xDEADBEEF
 config_num_sections: db 0
 config_xor_key:      db 0 
-                     dw 0
+                     dw 0 ; padding for alignment
 config_original_oep: dd 0
 config_image_base:   dq 0
 config_import_rva:   dd 0
 config_import_size:  dd 0
 config_reloc_rva:    dd 0
 config_reloc_size:   dd 0
-                     dq 0
+                     dq 0 ; padding for alignment
 config_sections:     times (16 * 8) db 0
 
 stub_entry:
@@ -133,7 +133,6 @@ get_export:
     add r9, rdi
 
     xor  rdx, rdx
-
 .search_loop:
     cmp edx, ecx
     jge .not_found
@@ -158,7 +157,6 @@ get_export:
     jmp .search_loop
 
 .found:
-
     movzx rbx, word [r9 + rdx*2]
 
     mov r8, [rsp + 20h]
@@ -171,7 +169,6 @@ get_export:
 
 .not_found:
     xor  rax, rax
-
 .done:
     add rsp, 28h
     pop r9
@@ -211,12 +208,6 @@ strcmp_ascii:
     ret
 
 
-
-
-
-
-
-
 ;function decrypt_all_sections
 decrypt_all_sections:
     push rbx
@@ -230,7 +221,6 @@ decrypt_all_sections:
 
     lea  rbx, [rel config_sections]
     xor  rdx, rdx
-
 .sect_loop:
     cmp rdx, rcx
     jge .done
@@ -252,7 +242,6 @@ decrypt_all_sections:
 
     inc rdx
     jmp .sect_loop
-
 .done:
     pop r8
     pop rdx
@@ -276,7 +265,7 @@ decrypt_xor:
     ret
 
 
-
+; fix imports function
 resolve_imports:
     push rbp
     mov rbp, rsp
@@ -293,9 +282,7 @@ resolve_imports:
     jz .done 
 
     lea rbx, [r12 + rcx]
-
 .next_descriptor:
-
     mov eax, dword [rbx + 0Ch] 
     test eax, eax
     jz .done
@@ -314,7 +301,6 @@ resolve_imports:
     mov esi, edi
 .use_int:
     add  rsi, r12
-
 .next_thunk:
     mov r8, qword [rsi]
     test r8, r8
@@ -322,7 +308,6 @@ resolve_imports:
 
     bt r8, 63
     jc .import_by_ordinal
-
 .import_by_name:
     mov  eax, r8d 
     add  rax, r12 
@@ -331,24 +316,19 @@ resolve_imports:
     mov rdx, rax 
     call r14 
     jmp .store_address
-
 .import_by_ordinal:
     movzx rcx, r8w 
     mov rcx, [rsp + 20h] 
     movzx rdx, r8w
     call r14 
-
 .store_address:
-
     mov qword [rdi], rax
     add rsi, 8 
     add rdi, 8  
     jmp .next_thunk
-
 .thunk_done:
     add rbx, 14h
     jmp .next_descriptor
-
 .done:
     add rsp, 48h
     pop r9
@@ -360,6 +340,8 @@ resolve_imports:
     pop rbp
     ret
 
+
+; relocation function
 apply_relocations:
     push rbp
     mov rbp, rsp
@@ -385,7 +367,6 @@ apply_relocations:
     lea rbx, [r12 + rcx]
     mov edx, dword [rel config_reloc_size] 
     xor rdi, rdi 
-
 .next_block:
     cmp edi, edx
     jge .done
@@ -403,7 +384,6 @@ apply_relocations:
 
     lea  rax, [rbx + 8]   
     xor  r10, r10  
-
 .next_entry:
     cmp r10, rsi
     jge .block_done
@@ -418,17 +398,14 @@ apply_relocations:
 
     add  r11, r8
     add  qword [r11], r9 
-
 .skip_entry:
     inc r10
     jmp .next_entry
-
 .block_done:
     mov ecx, dword [rbx + 4] 
     add edi, ecx
     add rbx, rcx
     jmp .next_block
-
 .done:
     pop r9
     pop r8
