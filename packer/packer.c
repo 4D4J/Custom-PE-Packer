@@ -100,11 +100,13 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
     printf("[+] Import Dir : RVA=0x%08X, size=%u\n", import_rva, import_size);
     printf("[+] Reloc Dir : RVA=0x%08X, size=%u\n", reloc_rva, reloc_size);
 
+    for (int i = 0; i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; i++) {
+        pe->nt_hdrs->OptionalHeader.DataDirectory[i].VirtualAddress = 0;
+        pe->nt_hdrs->OptionalHeader.DataDirectory[i].Size = 0;
+    }
 
-    pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = 0;
-    pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = 0;
-    pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress = 0;
-    pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size = 0;
+    pe->nt_hdrs->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+    pe->nt_hdrs->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
 
     CryptoAlgorithm *algo = &xor_cipher;
     CryptoContext *ctx = crypto_create(algo, &xor_key, 1);
