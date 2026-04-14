@@ -1,4 +1,4 @@
-bit 64
+bits 64
 default rel
 
 config_magic:        dq 0xDEADBEEF

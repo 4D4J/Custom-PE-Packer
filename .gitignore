@@ -1,9 +1,7 @@
-# Fichiers d'exploration / notes personnelles
 *.explc
 *.expl
 *.explh
 
-# Binaires compilés
 stub.bin
 packer.exe
 *.exe
@@ -11,10 +9,11 @@ packer.exe
 *.o
 *.pdb
 
-# Fichiers générés par NASM
 *.lst
 
-# Éditeurs
+build/
+cmake-build-*/
+
 *.swp
 *~
 .vscode/
