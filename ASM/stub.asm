@@ -3,8 +3,9 @@ default rel
 
 config_magic:               dq 0xDEADBEEF ; 0x00
 config_num_sections:        db 0          ; 0x08
-config_xor_key:             db 0          ; 0x09
-                            dw 0          ; 0x0A padding
+config_xor_key:             db 0          ; 0x09  (only used when algo=0)
+config_algo:                db 0          ; 0x0A  0=XOR, 1=AES128CTR
+                            db 0          ; 0x0B  padding
 config_original_oep:        dd 0          ; 0x0C
 config_image_base:          dq 0          ; 0x10
 config_import_rva:          dd 0          ; 0x18
@@ -15,8 +16,11 @@ config_hash_getprocaddr:    dd 0          ; 0x28 - DJB2("GetProcAddress")
 config_hash_loadlib:        dd 0          ; 0x2C - DJB2("LoadLibraryA")
 config_hash_virtualalloc:   dd 0          ; 0x30 - DJB2("VirtualAlloc")
                             dd 0          ; 0x34 padding
-                            dq 0          ; 0x38 padding (reserve for future hashes)
-config_sections:            times (16 * 8) db 0  ; 0x40, STUB_CODE_OFFSET=0xC0
+                            dq 0          ; 0x38 padding
+config_sections:            times (16 * 8) db 0  ; 0x40  (16 entries of {rva,size})
+config_aes_key:             times 16 db 0 ; 0xC0  AES-128 master key
+config_aes_nonce:           dq 0          ; 0xD0  AES-CTR nonce (64 bits)
+                            dq 0          ; 0xD8  padding (reserved) -> STUB_CODE_OFFSET=0xE0
 
 stub_entry:
     ; Phase 1: capture [rsp] (BTIT+offset) and pristine RSP before any push.
@@ -184,8 +188,13 @@ djb2_hash:
     ret
 
 
-; decrypt_all_sections() - XOR-decrypt each config_sections entry in place.
+; decrypt_all_sections() - dispatch on config_algo (0=XOR, 1=AES128-CTR).
 decrypt_all_sections:
+    movzx eax, byte [rel config_algo]
+    cmp al, 1
+    je decrypt_all_sections_aes
+
+    ; --- XOR path ---
     push rbx
     push rcx
     push rdx
@@ -238,6 +247,157 @@ decrypt_xor:
     inc rcx
     jmp .xor_loop
 .done:
+    ret
+
+
+; decrypt_all_sections_aes() - AES-128-CTR path. Expands the key once, then
+;   iterates sections. Round keys live on our stack (176 B).
+decrypt_all_sections_aes:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r14
+    push r15
+    sub rsp, 192                        ; 176 round keys + 16 pad (16-align)
+
+    mov rdi, rsp
+    call aes128_key_expand              ; fills [rsp .. rsp+175]
+
+    movzx r15, byte [rel config_num_sections]
+    test r15, r15
+    jz .done
+
+    lea r14, [rel config_sections]
+    xor rbx, rbx                        ; section idx
+.sect_loop:
+    cmp rbx, r15
+    jae .done
+
+    mov r8d, dword [r14 + rbx*8]        ; rva
+    mov r9d, dword [r14 + rbx*8 + 4]    ; raw size
+
+    lea rdi, [r12 + r8]                 ; data = base + rva
+    mov rsi, r9
+    mov edx, r8d                        ; counter uses section rva
+    mov r8, rsp                         ; round keys
+    call decrypt_aes_ctr
+
+    inc rbx
+    jmp .sect_loop
+.done:
+    add rsp, 192
+    pop r15
+    pop r14
+    pop rbx
+    pop rbp
+    ret
+
+
+; aes128_key_expand(rdi = &round_keys[11*16])
+;   Loads master key from config_aes_key, derives all 11 round keys at rdi.
+%macro AES_EXPAND_ROUND 2    ; 1 = round, 2 = rcon
+    aeskeygenassist xmm1, xmm0, %2
+    call aes128_schedule_step
+    movdqu [rdi + %1*16], xmm0
+%endmacro
+
+aes128_key_expand:
+    movdqu xmm0, [rel config_aes_key]
+    movdqu [rdi + 0*16], xmm0
+    AES_EXPAND_ROUND 1,  0x01
+    AES_EXPAND_ROUND 2,  0x02
+    AES_EXPAND_ROUND 3,  0x04
+    AES_EXPAND_ROUND 4,  0x08
+    AES_EXPAND_ROUND 5,  0x10
+    AES_EXPAND_ROUND 6,  0x20
+    AES_EXPAND_ROUND 7,  0x40
+    AES_EXPAND_ROUND 8,  0x80
+    AES_EXPAND_ROUND 9,  0x1B
+    AES_EXPAND_ROUND 10, 0x36
+    ret
+
+
+; aes128_schedule_step: xmm0=prev_rk, xmm1=aeskeygen result -> xmm0=next_rk.
+aes128_schedule_step:
+    pshufd xmm1, xmm1, 0xFF
+    movdqa xmm2, xmm0
+    pslldq xmm2, 4
+    pxor   xmm0, xmm2
+    pslldq xmm2, 4
+    pxor   xmm0, xmm2
+    pslldq xmm2, 4
+    pxor   xmm0, xmm2
+    pxor   xmm0, xmm1
+    ret
+
+
+; aes128_encrypt_block(xmm0=input, r8=&round_keys[0]) -> xmm0=ciphertext
+aes128_encrypt_block:
+    pxor       xmm0, [r8 + 0*16]
+    aesenc     xmm0, [r8 + 1*16]
+    aesenc     xmm0, [r8 + 2*16]
+    aesenc     xmm0, [r8 + 3*16]
+    aesenc     xmm0, [r8 + 4*16]
+    aesenc     xmm0, [r8 + 5*16]
+    aesenc     xmm0, [r8 + 6*16]
+    aesenc     xmm0, [r8 + 7*16]
+    aesenc     xmm0, [r8 + 8*16]
+    aesenc     xmm0, [r8 + 9*16]
+    aesenclast xmm0, [r8 + 10*16]
+    ret
+
+
+; decrypt_aes_ctr(rdi=data, rsi=size, edx=section_rva, r8=&round_keys[0])
+;   Counter block = config_aes_nonce (8B) || section_rva (4B) || block_idx_LE (4B)
+decrypt_aes_ctr:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 32                         ; [rsp..15]=counter, [rsp+16..31]=ks tail
+
+    mov rax, qword [rel config_aes_nonce]
+    mov qword [rsp],     rax
+    mov dword [rsp + 8], edx
+    mov dword [rsp + 12], 0
+
+    xor rbx, rbx                        ; byte_offset
+    xor r10d, r10d                      ; block_idx
+.block_loop:
+    cmp rbx, rsi
+    jae .done
+
+    mov dword [rsp + 12], r10d
+    movdqu xmm0, [rsp]
+    call aes128_encrypt_block           ; xmm0 = keystream
+
+    mov r11, rsi
+    sub r11, rbx                        ; remaining bytes
+    cmp r11, 16
+    jb .partial
+
+    movdqu xmm1, [rdi + rbx]
+    pxor   xmm0, xmm1
+    movdqu [rdi + rbx], xmm0
+    add rbx, 16
+    inc r10d
+    jmp .block_loop
+
+.partial:
+    movdqu [rsp + 16], xmm0
+    lea rcx, [rdi + rbx]
+    xor r9, r9
+.tail_loop:
+    cmp r9, r11
+    jae .done
+    mov al, byte [rsp + 16 + r9]
+    xor byte [rcx + r9], al
+    inc r9
+    jmp .tail_loop
+
+.done:
+    add rsp, 32
+    pop rbx
+    pop rbp
     ret
 
 

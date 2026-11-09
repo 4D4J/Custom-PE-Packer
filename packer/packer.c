@@ -1,3 +1,4 @@
+#define _CRT_RAND_S
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,19 +6,17 @@
 #include "pe_utils.h"
 #include "crypto.h"
 
-#define STUB_CODE_OFFSET 0xC0U
+#define STUB_CODE_OFFSET 0xE0U
 #define STUB_MAX_SECTIONS 16
 #define STUB_SECTION_NAME ".stub"
-/* RWX because the stub writes to its own data slots at runtime
-   (legit_bti_cache, legit_rtl_cache, initial_rsp_cache for Call Stack
-   Spoofing). A production packer would VirtualProtect back to RX after
-   init, but we keep it simple for pedagogy. */
+
 #define STUB_SECTION_FLAGS (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
 
 /* Offsets inside stub.bin's config block. Must match stub.asm layout. */
 #define CFG_OFF_MAGIC            0x00
 #define CFG_OFF_NUM_SECTIONS     0x08
 #define CFG_OFF_XOR_KEY          0x09
+#define CFG_OFF_ALGO             0x0A
 #define CFG_OFF_ORIGINAL_OEP     0x0C
 #define CFG_OFF_IMAGE_BASE       0x10
 #define CFG_OFF_IMPORT_RVA       0x18
@@ -28,10 +27,13 @@
 #define CFG_OFF_HASH_LOADLIB     0x2C
 #define CFG_OFF_HASH_VIRTUALALLOC 0x30
 #define CFG_OFF_SECTIONS         0x40
+#define CFG_OFF_AES_KEY          0xC0
+#define CFG_OFF_AES_NONCE        0xD0
 #define CONFIG_MAGIC_VALUE       0xDEADBEEF
 
-/* DJB2 : h = 5381 ; for each c : h = h*33 + c (mod 2^32).
-   Must match stub.asm::djb2_hash byte for byte. */
+#define CRYPTO_ALGO_XOR     0x00
+#define CRYPTO_ALGO_AES128  0x01
+
 static uint32_t djb2(const char *s) {
     uint32_t h = 5381;
     for (; *s; s++) {
@@ -111,8 +113,11 @@ static int should_encrypt_section(IMAGE_SECTION_HEADER *sect) {
 }
 
 
-static int pack_pe(const char *input_path, const char *output_path, const char *stub_path, uint8_t xor_key) {
+static int pack_pe(const char *input_path, const char *output_path, const char *stub_path,
+                    uint8_t algo_id, const uint8_t *key, size_t key_size) {
     int ret = -1;
+    CryptoContext *ctx = NULL;
+    CryptoAlgorithm *algo = (algo_id == CRYPTO_ALGO_AES128) ? &aes128_ctr_cipher : &xor_cipher;
 
     printf("[*] Chargement de %s...\n", input_path);
     PEContext *pe = pe_load(input_path);
@@ -163,8 +168,7 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
     pe->nt_hdrs->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
     pe->nt_hdrs->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_GUARD_CF;
 
-    CryptoAlgorithm *algo = &xor_cipher;
-    CryptoContext *ctx = crypto_create(algo, &xor_key, 1);
+    ctx = crypto_create(algo, key, key_size);
     if (!ctx) {
         fprintf(stderr, "[packer] Initialisation du contexte crypto échouée.\n");
         goto cleanup;
@@ -183,9 +187,10 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
         uint8_t *sect_data = pe->data + sect->PointerToRawData;
         size_t sect_size = sect->SizeOfRawData;
 
-        printf("[*] Chiffrement de [%.*s] : offset=0x%X, size=%u\n", 8, sect->Name, sect->PointerToRawData, (unsigned)sect_size);
+        printf("[*] Chiffrement de [%.*s] : offset=0x%X, size=%u, rva=0x%08X\n",
+               8, sect->Name, sect->PointerToRawData, (unsigned)sect_size, sect->VirtualAddress);
 
-        crypto_encrypt_section(algo, ctx, sect_data, sect_size);
+        crypto_encrypt_section(algo, ctx, sect_data, sect_size, sect->VirtualAddress);
 
         sect->Characteristics |= IMAGE_SCN_MEM_WRITE;
 
@@ -196,10 +201,10 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
         }
     }
 
-    algo->destroy(ctx);
-    ctx = NULL;
+    uint8_t nonce_buf[8] = {0};
+    (void)crypto_get_nonce(algo, ctx, nonce_buf, sizeof(nonce_buf));
 
-    printf("[+] %d section(s) chiffrée(s) avec %s (clé=0x%02X)\n", num_encrypted, algo->name, xor_key);
+    printf("[+] %d section(s) chiffrée(s) avec %s\n", num_encrypted, algo->name);
 
     size_t stub_size;
     uint8_t *stub_blob = load_stub_blob(stub_path, &stub_size);
@@ -218,7 +223,21 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
     printf("[+] stub.bin chargé (%zu octets), magic OK.\n", stub_size);
 
     stub_blob[CFG_OFF_NUM_SECTIONS] = (uint8_t)num_encrypted;
-    stub_blob[CFG_OFF_XOR_KEY] = xor_key;
+    stub_blob[CFG_OFF_ALGO] = algo_id;
+    if (algo_id == CRYPTO_ALGO_XOR) {
+        stub_blob[CFG_OFF_XOR_KEY] = key[0];
+    } else {
+        memcpy(stub_blob + CFG_OFF_AES_KEY,   key,       16);
+        memcpy(stub_blob + CFG_OFF_AES_NONCE, nonce_buf, 8);
+        printf("[+] AES key  : ");
+        for (int i = 0; i < 16; i++) printf("%02X", key[i]);
+        printf("\n[+] AES nonce: ");
+        for (int i = 0; i < 8;  i++) printf("%02X", nonce_buf[i]);
+        printf("\n");
+    }
+
+    algo->destroy(ctx);
+    ctx = NULL;
 
     write_u32_le(stub_blob, CFG_OFF_ORIGINAL_OEP, original_oep);
 
@@ -278,40 +297,80 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
     ret = 0;
 
 cleanup:
+    if (ctx) algo->destroy(ctx);
     pe_free(pe);
     return ret;
+}
+
+static int generate_aes_key(uint8_t key[16]) {
+    unsigned int r;
+    for (int i = 0; i < 16; i += 4) {
+        if (rand_s(&r) != 0) return -1;
+        memcpy(key + i, &r, 4);
+    }
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
     printf("PE Packer Pédagogique x64\n\n");
 
-    if (argc < 3) {
-        fprintf(stderr, "Usage : %s <target.exe> <output.exe> [xor_key_hex] [stub.bin_path]\n"
-                        " xor_key_hex : clé XOR en hexadécimal (défaut: 0xAB)\n"
-                        " stub.bin : chemin vers le bytecode du stub (défaut: stub.bin)\n"
-                        "\nExemple : %s calc.exe calc_packed.exe 0x42\n",
-                argv[0], argv[0]);
+    const char *input_path  = NULL;
+    const char *output_path = NULL;
+    const char *stub_path   = "stub.bin";
+    uint8_t algo_id = CRYPTO_ALGO_AES128;
+    uint8_t xor_key = 0xAB;
+    int positional = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--algo") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "xor") == 0)       algo_id = CRYPTO_ALGO_XOR;
+            else if (strcmp(v, "aes") == 0)  algo_id = CRYPTO_ALGO_AES128;
+            else { fprintf(stderr, "[packer] --algo doit être xor|aes.\n"); return 1; }
+        } else if (strcmp(argv[i], "--stub") == 0 && i + 1 < argc) {
+            stub_path = argv[++i];
+        } else if (strcmp(argv[i], "--xor-key") == 0 && i + 1 < argc) {
+            long v = strtol(argv[++i], NULL, 16);
+            if (v < 0 || v > 255) { fprintf(stderr, "[packer] --xor-key doit être 0x00–0xFF.\n"); return 1; }
+            xor_key = (uint8_t)v;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "[packer] Option inconnue : %s\n", argv[i]);
+            return 1;
+        } else {
+            if (positional == 0)      input_path = argv[i];
+            else if (positional == 1) output_path = argv[i];
+            positional++;
+        }
+    }
+
+    if (!input_path || !output_path) {
+        fprintf(stderr,
+            "Usage : %s <target.exe> <output.exe> [--algo xor|aes] [--xor-key HH] [--stub path]\n"
+            "  --algo       : xor (clé 1 octet) ou aes (AES-128-CTR via AES-NI, défaut)\n"
+            "  --xor-key    : clé XOR en hex (défaut 0xAB), ignoré si --algo aes\n"
+            "  --stub       : chemin vers stub.bin (défaut: stub.bin)\n"
+            "\nExemple : %s calc.exe calc_packed.exe --algo aes\n",
+            argv[0], argv[0]);
         return 1;
     }
 
-    const char *input_path  = argv[1];
-    const char *output_path = argv[2];
-    const char *stub_path   = (argc >= 5) ? argv[4] : "stub.bin";
-
-    uint8_t xor_key = 0xAB; 
-    if (argc >= 4) {
-        long key_val = strtol(argv[3], NULL, 16);
-        if (key_val < 0 || key_val > 255) {
-            fprintf(stderr, "[packer] Clé XOR invalide (doit être 0x00–0xFF).\n");
+    uint8_t key_buf[16];
+    size_t  key_size;
+    if (algo_id == CRYPTO_ALGO_AES128) {
+        if (generate_aes_key(key_buf) != 0) {
+            fprintf(stderr, "[packer] Génération de la clé AES échouée.\n");
             return 1;
         }
-        xor_key = (uint8_t)key_val;
+        key_size = 16;
+    } else {
+        key_buf[0] = xor_key;
+        key_size = 1;
     }
 
-    printf("[*] Cible : %s\n", input_path);
-    printf("[*] Sortie : %s\n", output_path);
-    printf("[*] Stub : %s\n", stub_path);
-    printf("[*] Clé XOR : 0x%02X\n\n", xor_key);
+    printf("[*] Cible   : %s\n", input_path);
+    printf("[*] Sortie  : %s\n", output_path);
+    printf("[*] Stub    : %s\n", stub_path);
+    printf("[*] Algo    : %s\n\n", (algo_id == CRYPTO_ALGO_AES128) ? "AES-128-CTR (AES-NI)" : "XOR 1-octet");
 
-    return pack_pe(input_path, output_path, stub_path, xor_key);
+    return pack_pe(input_path, output_path, stub_path, algo_id, key_buf, key_size);
 }
