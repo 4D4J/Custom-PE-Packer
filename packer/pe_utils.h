@@ -133,6 +133,12 @@ int pe_save(PEContext *pe, const char *path);
 
 void pe_free(PEContext *pe);
 
+/* Computes OptionalHeader.CheckSum per the standard Win32 algorithm
+   (same output as imagehlp!CheckSumMappedFile). Treats the CheckSum field
+   itself as zero during the sum. Caller should zero the field first and
+   then store the returned value. */
+uint32_t pe_compute_checksum(PEContext *pe);
+
 uint32_t align_up(uint32_t value, uint32_t alignment);
 
 #endif

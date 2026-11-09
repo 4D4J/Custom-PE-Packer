@@ -8,7 +8,7 @@
 
 #define STUB_CODE_OFFSET 0xE0U
 #define STUB_MAX_SECTIONS 16
-#define STUB_SECTION_NAME ".stub"
+#define STUB_SECTION_NAME_DEFAULT ".text"  /* blends with existing .text */
 
 #define STUB_SECTION_FLAGS (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
 
@@ -101,8 +101,7 @@ static const char *const SKIP_ENCRYPT_SECTIONS[] = {
 static int should_encrypt_section(IMAGE_SECTION_HEADER *sect) {
     if (sect->SizeOfRawData == 0) return 0;
 
-    if (strncmp((char *)sect->Name, STUB_SECTION_NAME, 8) == 0) return 0;
-
+    /* Called BEFORE our section is added, so no self-check needed. */
     for (int i = 0; SKIP_ENCRYPT_SECTIONS[i]; i++) {
         if (strncmp((char *)sect->Name, SKIP_ENCRYPT_SECTIONS[i], 8) == 0) {
             return 0;
@@ -113,11 +112,25 @@ static int should_encrypt_section(IMAGE_SECTION_HEADER *sect) {
 }
 
 
+typedef enum {
+    TS_MODE_PRESERVE = 0, 
+    TS_MODE_ZERO,          
+    TS_MODE_RANDOM,        
+} TimestampMode;
+
+typedef struct {
+    const char    *section_name;   /* 1..8 chars, truncated if longer */
+    TimestampMode  ts_mode;
+    int            fix_checksum;   /* 1 to recompute OptionalHeader.CheckSum */
+} HygieneOptions;
+
 static int pack_pe(const char *input_path, const char *output_path, const char *stub_path,
-                    uint8_t algo_id, const uint8_t *key, size_t key_size) {
+                    uint8_t algo_id, const uint8_t *key, size_t key_size,
+                    const HygieneOptions *hy) {
     int ret = -1;
     CryptoContext *ctx = NULL;
     CryptoAlgorithm *algo = (algo_id == CRYPTO_ALGO_AES128) ? &aes128_ctr_cipher : &xor_cipher;
+    const char *section_name = (hy && hy->section_name) ? hy->section_name : STUB_SECTION_NAME_DEFAULT;
 
     printf("[*] Chargement de %s...\n", input_path);
     PEContext *pe = pe_load(input_path);
@@ -266,27 +279,60 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
 
     printf("[+] Bloc de configuration rempli (%d sections référencées).\n", num_encrypted);
 
-    printf("[*] Ajout de la section .stub...\n");
-    if (pe_add_section(pe, STUB_SECTION_NAME, stub_blob, stub_size, STUB_SECTION_FLAGS) != 0) {
-        fprintf(stderr, "[packer] Échec de l'ajout de la section .stub.\n");
+    printf("[*] Ajout de la section [%s]...\n", section_name);
+    if (pe_add_section(pe, section_name, stub_blob, stub_size, STUB_SECTION_FLAGS) != 0) {
+        fprintf(stderr, "[packer] Échec de l'ajout de la section.\n");
         free(stub_blob);
         goto cleanup;
     }
     free(stub_blob);
     stub_blob = NULL;
 
-    IMAGE_SECTION_HEADER *stub_sect = pe_get_section_by_name(pe, STUB_SECTION_NAME);
+    /* pe_get_section_by_name returns the FIRST match — our section is at the
+       end of the table, so look it up by index to avoid aliasing with an
+       existing section that has the same name. */
+    IMAGE_SECTION_HEADER *stub_sect = pe_get_section_by_index(pe, pe->num_sections - 1);
     if (!stub_sect) {
-        fprintf(stderr, "[packer] Section .stub introuvable après l'ajout — bug interne.\n");
+        fprintf(stderr, "[packer] Section introuvable après l'ajout — bug interne.\n");
         goto cleanup;
     }
-    printf("[+] Section .stub : VA=0x%08X, offset=0x%X, size=%u\n", stub_sect->VirtualAddress, stub_sect->PointerToRawData, stub_sect->SizeOfRawData);
+    printf("[+] Section [%.*s] : VA=0x%08X, offset=0x%X, size=%u\n",
+           8, stub_sect->Name, stub_sect->VirtualAddress, stub_sect->PointerToRawData, stub_sect->SizeOfRawData);
 
     uint32_t new_ep = stub_sect->VirtualAddress + STUB_CODE_OFFSET;
     pe->nt_hdrs->OptionalHeader.AddressOfEntryPoint = new_ep;
     printf("[+] AddressOfEntryPoint redirigé : 0x%08X → 0x%08X\n",
            original_oep, new_ep);
-		   
+
+    /* --- PE hygiene pass --- */
+    if (hy) {
+        uint32_t orig_ts = pe->nt_hdrs->FileHeader.TimeDateStamp;
+        uint32_t new_ts = orig_ts;
+        switch (hy->ts_mode) {
+            case TS_MODE_ZERO:   new_ts = 0; break;
+            case TS_MODE_RANDOM: {
+                unsigned int r = 0;
+                rand_s(&r);
+                /* Anchor around Jan 2016 (1451606400) + up to ~10 years span. */
+                new_ts = 1451606400u + (r % (10u * 365u * 86400u));
+                break;
+            }
+            case TS_MODE_PRESERVE:
+            default: break;
+        }
+        if (new_ts != orig_ts) {
+            pe->nt_hdrs->FileHeader.TimeDateStamp = new_ts;
+            printf("[+] TimeDateStamp : 0x%08X -> 0x%08X\n", orig_ts, new_ts);
+        }
+
+        if (hy->fix_checksum) {
+            pe->nt_hdrs->OptionalHeader.CheckSum = 0;
+            uint32_t new_sum = pe_compute_checksum(pe);
+            pe->nt_hdrs->OptionalHeader.CheckSum = new_sum;
+            printf("[+] CheckSum recalculé : 0x%08X\n", new_sum);
+        }
+    }
+
     printf("[*] Écriture de %s...\n", output_path);
     if (pe_save(pe, output_path) != 0) {
         goto cleanup;
@@ -319,6 +365,7 @@ int main(int argc, char *argv[]) {
     const char *stub_path   = "stub.bin";
     uint8_t algo_id = CRYPTO_ALGO_AES128;
     uint8_t xor_key = 0xAB;
+    HygieneOptions hy = { .section_name = NULL, .ts_mode = TS_MODE_PRESERVE, .fix_checksum = 1 };
     int positional = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -333,6 +380,20 @@ int main(int argc, char *argv[]) {
             long v = strtol(argv[++i], NULL, 16);
             if (v < 0 || v > 255) { fprintf(stderr, "[packer] --xor-key doit être 0x00–0xFF.\n"); return 1; }
             xor_key = (uint8_t)v;
+        } else if (strcmp(argv[i], "--section-name") == 0 && i + 1 < argc) {
+            hy.section_name = argv[++i];
+            if (strlen(hy.section_name) == 0 || strlen(hy.section_name) > 8) {
+                fprintf(stderr, "[packer] --section-name doit faire 1 à 8 caractères.\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--timestamp") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if      (strcmp(v, "preserve") == 0) hy.ts_mode = TS_MODE_PRESERVE;
+            else if (strcmp(v, "zero")     == 0) hy.ts_mode = TS_MODE_ZERO;
+            else if (strcmp(v, "random")   == 0) hy.ts_mode = TS_MODE_RANDOM;
+            else { fprintf(stderr, "[packer] --timestamp doit être preserve|zero|random.\n"); return 1; }
+        } else if (strcmp(argv[i], "--no-checksum") == 0) {
+            hy.fix_checksum = 0;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "[packer] Option inconnue : %s\n", argv[i]);
             return 1;
@@ -345,11 +406,14 @@ int main(int argc, char *argv[]) {
 
     if (!input_path || !output_path) {
         fprintf(stderr,
-            "Usage : %s <target.exe> <output.exe> [--algo xor|aes] [--xor-key HH] [--stub path]\n"
-            "  --algo       : xor (clé 1 octet) ou aes (AES-128-CTR via AES-NI, défaut)\n"
-            "  --xor-key    : clé XOR en hex (défaut 0xAB), ignoré si --algo aes\n"
-            "  --stub       : chemin vers stub.bin (défaut: stub.bin)\n"
-            "\nExemple : %s calc.exe calc_packed.exe --algo aes\n",
+            "Usage : %s <target.exe> <output.exe> [options]\n"
+            "  --algo xor|aes       : chiffrement (défaut: aes, AES-128-CTR via AES-NI)\n"
+            "  --xor-key HH         : clé XOR en hex (défaut: 0xAB), ignoré si --algo aes\n"
+            "  --stub path          : chemin vers stub.bin (défaut: stub.bin)\n"
+            "  --section-name NAME  : nom de la section stub, 1..8 chars (défaut: .text)\n"
+            "  --timestamp MODE     : preserve|zero|random (défaut: preserve)\n"
+            "  --no-checksum        : ne pas recalculer OptionalHeader.CheckSum\n"
+            "\nExemple : %s calc.exe calc_packed.exe --algo aes --timestamp random\n",
             argv[0], argv[0]);
         return 1;
     }
@@ -367,10 +431,16 @@ int main(int argc, char *argv[]) {
         key_size = 1;
     }
 
-    printf("[*] Cible   : %s\n", input_path);
-    printf("[*] Sortie  : %s\n", output_path);
-    printf("[*] Stub    : %s\n", stub_path);
-    printf("[*] Algo    : %s\n\n", (algo_id == CRYPTO_ALGO_AES128) ? "AES-128-CTR (AES-NI)" : "XOR 1-octet");
+    const char *ts_label = (hy.ts_mode == TS_MODE_ZERO)   ? "zero"
+                         : (hy.ts_mode == TS_MODE_RANDOM) ? "random"
+                                                          : "preserve";
+    printf("[*] Cible      : %s\n", input_path);
+    printf("[*] Sortie     : %s\n", output_path);
+    printf("[*] Stub       : %s\n", stub_path);
+    printf("[*] Algo       : %s\n", (algo_id == CRYPTO_ALGO_AES128) ? "AES-128-CTR (AES-NI)" : "XOR 1-octet");
+    printf("[*] Section    : %s\n", hy.section_name ? hy.section_name : STUB_SECTION_NAME_DEFAULT);
+    printf("[*] Timestamp  : %s\n", ts_label);
+    printf("[*] Checksum   : %s\n\n", hy.fix_checksum ? "recalculé" : "inchangé");
 
-    return pack_pe(input_path, output_path, stub_path, algo_id, key_buf, key_size);
+    return pack_pe(input_path, output_path, stub_path, algo_id, key_buf, key_size, &hy);
 }

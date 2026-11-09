@@ -123,6 +123,38 @@ void pe_free(PEContext *pe) {
     free(pe);
 }
 
+/* Standard Win32 PE CheckSum: sum of 16-bit words with carry-wrap, final
+   plus file size. Matches imagehlp!CheckSumMappedFile. The 4-byte CheckSum
+   field itself is skipped (treated as zero) during the fold. */
+uint32_t pe_compute_checksum(PEContext *pe) {
+    if (!pe || !pe->data || !pe->nt_hdrs) return 0;
+
+    size_t   size   = pe->size;
+    uint8_t *bytes  = pe->data;
+    size_t   cs_off = (size_t)((uint8_t *)&pe->nt_hdrs->OptionalHeader.CheckSum - bytes);
+
+    uint32_t sum = 0;
+    size_t   words = size / 2;
+    for (size_t i = 0; i < words; i++) {
+        size_t byte_off = i * 2;
+        uint16_t w;
+        if (byte_off >= cs_off && byte_off < cs_off + 4) {
+            w = 0;
+        } else {
+            w = (uint16_t)(bytes[byte_off] | ((uint16_t)bytes[byte_off + 1] << 8));
+        }
+        sum += w;
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    /* Trailing odd byte (very rare in practice: FileAlignment >= 512). */
+    if (size & 1) {
+        sum += bytes[size - 1];
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    return sum + (uint32_t)size;
+}
+
 IMAGE_SECTION_HEADER *pe_get_section_by_index(PEContext *pe, int index) {
     if (!pe || index < 0 || index >= pe->num_sections) return NULL;
     return &pe->sections[index];
