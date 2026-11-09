@@ -5,22 +5,40 @@
 #include "pe_utils.h"
 #include "crypto.h"
 
-#define STUB_CODE_OFFSET 0xB0U
+#define STUB_CODE_OFFSET 0xC0U
 #define STUB_MAX_SECTIONS 16
 #define STUB_SECTION_NAME ".stub"
-#define STUB_SECTION_FLAGS (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ)
+/* RWX because the stub writes to its own data slots at runtime
+   (legit_bti_cache, legit_rtl_cache, initial_rsp_cache for Call Stack
+   Spoofing). A production packer would VirtualProtect back to RX after
+   init, but we keep it simple for pedagogy. */
+#define STUB_SECTION_FLAGS (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE)
 
-#define CFG_OFF_MAGIC 0x00
-#define CFG_OFF_NUM_SECTIONS 0x08
-#define CFG_OFF_XOR_KEY 0x09
-#define CFG_OFF_ORIGINAL_OEP 0x0C
-#define CFG_OFF_IMAGE_BASE 0x10
-#define CFG_OFF_IMPORT_RVA 0x18
-#define CFG_OFF_IMPORT_SIZE 0x1C
-#define CFG_OFF_RELOC_RVA 0x20
-#define CFG_OFF_RELOC_SIZE 0x24
-#define CFG_OFF_SECTIONS 0x30
-#define CONFIG_MAGIC_VALUE 0xDEADBEEF
+/* Offsets inside stub.bin's config block. Must match stub.asm layout. */
+#define CFG_OFF_MAGIC            0x00
+#define CFG_OFF_NUM_SECTIONS     0x08
+#define CFG_OFF_XOR_KEY          0x09
+#define CFG_OFF_ORIGINAL_OEP     0x0C
+#define CFG_OFF_IMAGE_BASE       0x10
+#define CFG_OFF_IMPORT_RVA       0x18
+#define CFG_OFF_IMPORT_SIZE      0x1C
+#define CFG_OFF_TLS_RVA          0x20
+#define CFG_OFF_TLS_SIZE         0x24
+#define CFG_OFF_HASH_GETPROCADDR 0x28
+#define CFG_OFF_HASH_LOADLIB     0x2C
+#define CFG_OFF_HASH_VIRTUALALLOC 0x30
+#define CFG_OFF_SECTIONS         0x40
+#define CONFIG_MAGIC_VALUE       0xDEADBEEF
+
+/* DJB2 : h = 5381 ; for each c : h = h*33 + c (mod 2^32).
+   Must match stub.asm::djb2_hash byte for byte. */
+static uint32_t djb2(const char *s) {
+    uint32_t h = 5381;
+    for (; *s; s++) {
+        h = (h * 33u) + (uint8_t)*s;
+    }
+    return h;
+}
 
 static uint8_t *load_stub_blob(const char *stub_path, size_t *out_size) {
     FILE *f = fopen(stub_path, "rb");
@@ -43,8 +61,13 @@ static uint8_t *load_stub_blob(const char *stub_path, size_t *out_size) {
     uint8_t *buf = malloc((size_t)sz);
     if (!buf) { fclose(f); return NULL; }
 
-    fread(buf, 1, (size_t)sz, f);
+    size_t n = fread(buf, 1, (size_t)sz, f);
     fclose(f);
+    if (n != (size_t)sz) {
+        fprintf(stderr, "[packer] Lecture incomplète de %s (%zu/%ld octets).\n", stub_path, n, sz);
+        free(buf);
+        return NULL;
+    }
 
     *out_size = (size_t)sz;
     return buf;
@@ -65,10 +88,24 @@ static void write_u64_le(uint8_t *buf, size_t offset, uint64_t value) {
 }
 
 
+static const char *const SKIP_ENCRYPT_SECTIONS[] = {
+    ".rsrc",
+    ".pdata",
+    ".reloc",
+    ".00cfg",
+    NULL,
+};
+
 static int should_encrypt_section(IMAGE_SECTION_HEADER *sect) {
     if (sect->SizeOfRawData == 0) return 0;
 
     if (strncmp((char *)sect->Name, STUB_SECTION_NAME, 8) == 0) return 0;
+
+    for (int i = 0; SKIP_ENCRYPT_SECTIONS[i]; i++) {
+        if (strncmp((char *)sect->Name, SKIP_ENCRYPT_SECTIONS[i], 8) == 0) {
+            return 0;
+        }
+    }
 
     return 1;
 }
@@ -93,20 +130,38 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
     uint32_t import_rva = pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
     uint32_t import_size = pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
 
-    uint32_t reloc_rva = pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
-    uint32_t reloc_size = pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+    uint32_t tls_rva = pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+    uint32_t tls_size = pe->nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
 
     printf("[+] OEP original : 0x%08X\n", original_oep);
-    printf("[+] Import Dir : RVA=0x%08X, size=%u\n", import_rva, import_size);
-    printf("[+] Reloc Dir : RVA=0x%08X, size=%u\n", reloc_rva, reloc_size);
+    printf("[+] Import Dir   : RVA=0x%08X, size=%u\n", import_rva, import_size);
+    printf("[+] TLS Dir      : RVA=0x%08X, size=%u%s\n", tls_rva, tls_size,
+           tls_rva ? "" : " (aucun TLS callback)");
 
-    for (int i = 0; i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; i++) {
-        pe->nt_hdrs->OptionalHeader.DataDirectory[i].VirtualAddress = 0;
-        pe->nt_hdrs->OptionalHeader.DataDirectory[i].Size = 0;
-    }
+
+    IMAGE_DATA_DIRECTORY *dirs = pe->nt_hdrs->OptionalHeader.DataDirectory;
+    dirs[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_TLS].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_IAT].Size = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress = 0;
+    dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size = 0;
 
     pe->nt_hdrs->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
     pe->nt_hdrs->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA;
+    pe->nt_hdrs->OptionalHeader.DllCharacteristics &= ~IMAGE_DLLCHARACTERISTICS_GUARD_CF;
 
     CryptoAlgorithm *algo = &xor_cipher;
     CryptoContext *ctx = crypto_create(algo, &xor_key, 1);
@@ -172,8 +227,17 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
     write_u32_le(stub_blob, CFG_OFF_IMPORT_RVA,  import_rva);
     write_u32_le(stub_blob, CFG_OFF_IMPORT_SIZE, import_size);
 
-    write_u32_le(stub_blob, CFG_OFF_RELOC_RVA,  reloc_rva);
-    write_u32_le(stub_blob, CFG_OFF_RELOC_SIZE, reloc_size);
+    write_u32_le(stub_blob, CFG_OFF_TLS_RVA,  tls_rva);
+    write_u32_le(stub_blob, CFG_OFF_TLS_SIZE, tls_size);
+
+    uint32_t h_getproc  = djb2("GetProcAddress");
+    uint32_t h_loadlib  = djb2("LoadLibraryA");
+    uint32_t h_vralloc  = djb2("VirtualAlloc");
+    write_u32_le(stub_blob, CFG_OFF_HASH_GETPROCADDR,  h_getproc);
+    write_u32_le(stub_blob, CFG_OFF_HASH_LOADLIB,      h_loadlib);
+    write_u32_le(stub_blob, CFG_OFF_HASH_VIRTUALALLOC, h_vralloc);
+    printf("[+] API hashes (DJB2): GetProcAddress=0x%08X, LoadLibraryA=0x%08X, VirtualAlloc=0x%08X\n",
+           h_getproc, h_loadlib, h_vralloc);
 
     for (int i = 0; i < num_encrypted; i++) {
         size_t entry_offset = CFG_OFF_SECTIONS + (size_t)(i * 8);

@@ -9,9 +9,16 @@
 #define IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x020B
 #define IMAGE_DIRECTORY_ENTRY_EXPORT 0
 #define IMAGE_DIRECTORY_ENTRY_IMPORT 1
+#define IMAGE_DIRECTORY_ENTRY_RESOURCE 2
 #define IMAGE_DIRECTORY_ENTRY_EXCEPTION 3
+#define IMAGE_DIRECTORY_ENTRY_SECURITY 4
 #define IMAGE_DIRECTORY_ENTRY_BASERELOC 5
+#define IMAGE_DIRECTORY_ENTRY_DEBUG 6
+#define IMAGE_DIRECTORY_ENTRY_TLS 9
 #define IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG 10
+#define IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT 11
+#define IMAGE_DIRECTORY_ENTRY_IAT 12
+#define IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT 13
 #define IMAGE_NUMBEROF_DIRECTORY_ENTRIES 16
 
 #define IMAGE_SCN_CNT_CODE 0x00000020
@@ -22,6 +29,7 @@
 
 #define IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA 0x0020
 #define IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE    0x0040
+#define IMAGE_DLLCHARACTERISTICS_GUARD_CF        0x4000
 
 #pragma pack(push, 1)
 
@@ -117,8 +125,6 @@ int pe_validate(PEContext *pe);
 IMAGE_SECTION_HEADER *pe_get_section_by_index(PEContext *pe, int index);
 
 IMAGE_SECTION_HEADER *pe_get_section_by_name(PEContext *pe, const char *name);
-
-size_t pe_rva_to_offset(PEContext *pe, uint32_t rva);
 
 int pe_add_section(PEContext *pe, const char *name,
                    const uint8_t *data, size_t data_size, uint32_t flags);

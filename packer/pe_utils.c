@@ -139,18 +139,6 @@ IMAGE_SECTION_HEADER *pe_get_section_by_name(PEContext *pe, const char *name) {
     return NULL;
 }
 
-size_t pe_rva_to_offset(PEContext *pe, uint32_t rva) {
-    for (int i = 0; i < pe->num_sections; i++) {
-        IMAGE_SECTION_HEADER *s = &pe->sections[i];
-        uint32_t section_va_end = s->VirtualAddress + s->SizeOfRawData;
-
-        if (rva >= s->VirtualAddress && rva < section_va_end) {
-            return (size_t)s->PointerToRawData + (rva - s->VirtualAddress);
-        }
-    }
-    return (size_t)-1;
-}
-
 int pe_add_section(PEContext *pe, const char *name,
                    const uint8_t *data, size_t data_size, uint32_t flags) {
     if (!pe || !name || !data || data_size == 0) return -1;
@@ -161,6 +149,24 @@ int pe_add_section(PEContext *pe, const char *name,
 
     if (pe->num_sections == 0) {
         fprintf(stderr, "[pe_add_section] PE sans sections — cas non géré.\n");
+        return -1;
+    }
+
+    size_t section_headers_offset =
+        (size_t)pe->dos_hdr->e_lfanew
+        + offsetof(IMAGE_NT_HEADERS64, OptionalHeader)
+        + pe->nt_hdrs->FileHeader.SizeOfOptionalHeader;
+    size_t next_header_offset =
+        section_headers_offset
+        + (size_t)pe->num_sections * sizeof(IMAGE_SECTION_HEADER);
+    size_t headers_room = opt->SizeOfHeaders;
+
+    if (next_header_offset + sizeof(IMAGE_SECTION_HEADER) > headers_room) {
+        fprintf(stderr,
+            "[pe_add_section] Pas de place pour un nouveau section header : "
+            "besoin de %zu octets, dispo %zu (SizeOfHeaders=0x%X).\n",
+            next_header_offset + sizeof(IMAGE_SECTION_HEADER),
+            headers_room, opt->SizeOfHeaders);
         return -1;
     }
 
