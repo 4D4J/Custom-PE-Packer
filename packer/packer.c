@@ -6,7 +6,7 @@
 #include "pe_utils.h"
 #include "crypto.h"
 
-#define STUB_CODE_OFFSET 0xE0U
+#define STUB_CODE_OFFSET 0x110U
 #define STUB_MAX_SECTIONS 16
 #define STUB_SECTION_NAME_DEFAULT ".text"  /* blends with existing .text */
 
@@ -29,7 +29,14 @@
 #define CFG_OFF_SECTIONS         0x40
 #define CFG_OFF_AES_KEY          0xC0
 #define CFG_OFF_AES_NONCE        0xD0
+#define CFG_OFF_PATCH_RVA        0xE0
+#define CFG_OFF_PATCH_SIZE       0xE4
+#define CFG_OFF_PATCH_BYTES      0xE8
+#define CFG_PATCH_MAX_SIZE       32
 #define CONFIG_MAGIC_VALUE       0xDEADBEEF
+
+#define PATCH_NEEDLE       "Hello from non-packed"
+#define PATCH_REPLACEMENT  "Hello from packed    "  /* same length, trailing spaces */
 
 #define CRYPTO_ALGO_XOR     0x00
 #define CRYPTO_ALGO_AES128  0x01
@@ -187,6 +194,35 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
         goto cleanup;
     }
 
+    /* Scan BEFORE encryption: search every readable section for the needle.
+       If found, remember its RVA so the stub can overwrite it at runtime
+       (after it has decrypted the section back to plaintext). */
+    const char *needle      = PATCH_NEEDLE;
+    size_t      needle_len  = sizeof(PATCH_NEEDLE) - 1;
+    const char *replacement = PATCH_REPLACEMENT;
+    size_t      replace_len = sizeof(PATCH_REPLACEMENT) - 1;
+    uint32_t    patch_rva   = 0;
+
+    if (needle_len == replace_len && replace_len <= CFG_PATCH_MAX_SIZE) {
+        for (int i = 0; i < pe->num_sections && patch_rva == 0; i++) {
+            IMAGE_SECTION_HEADER *s = pe_get_section_by_index(pe, i);
+            if (s->SizeOfRawData < needle_len) continue;
+            const uint8_t *data = pe->data + s->PointerToRawData;
+            size_t limit = (size_t)s->SizeOfRawData - needle_len;
+            for (size_t j = 0; j <= limit; j++) {
+                if (memcmp(data + j, needle, needle_len) == 0) {
+                    patch_rva = s->VirtualAddress + (uint32_t)j;
+                    printf("[+] Needle trouvée dans [%.*s] à RVA=0x%08X\n",
+                           8, s->Name, patch_rva);
+                    break;
+                }
+            }
+        }
+        if (patch_rva == 0) {
+            printf("[ ] Needle non trouvée — pas de patch runtime.\n");
+        }
+    }
+
     struct { uint32_t va; uint32_t raw_size; } encrypted_sections[STUB_MAX_SECTIONS];
     int num_encrypted = 0;
 
@@ -275,6 +311,14 @@ static int pack_pe(const char *input_path, const char *output_path, const char *
         size_t entry_offset = CFG_OFF_SECTIONS + (size_t)(i * 8);
         write_u32_le(stub_blob, entry_offset, encrypted_sections[i].va);
         write_u32_le(stub_blob, entry_offset + 4, encrypted_sections[i].raw_size);
+    }
+
+    if (patch_rva != 0) {
+        write_u32_le(stub_blob, CFG_OFF_PATCH_RVA,  patch_rva);
+        write_u32_le(stub_blob, CFG_OFF_PATCH_SIZE, (uint32_t)replace_len);
+        memcpy(stub_blob + CFG_OFF_PATCH_BYTES, replacement, replace_len);
+        printf("[+] Patch runtime : RVA=0x%08X, %zu octets (\"%s\" -> \"%s\")\n",
+               patch_rva, replace_len, needle, replacement);
     }
 
     printf("[+] Bloc de configuration rempli (%d sections référencées).\n", num_encrypted);

@@ -20,7 +20,11 @@ config_hash_virtualalloc:   dd 0          ; 0x30 - DJB2("VirtualAlloc")
 config_sections:            times (16 * 8) db 0  ; 0x40  (16 entries of {rva,size})
 config_aes_key:             times 16 db 0 ; 0xC0  AES-128 master key
 config_aes_nonce:           dq 0          ; 0xD0  AES-CTR nonce (64 bits)
-                            dq 0          ; 0xD8  padding (reserved) -> STUB_CODE_OFFSET=0xE0
+                            dq 0          ; 0xD8  padding
+config_patch_rva:           dd 0          ; 0xE0  runtime patch target RVA (0 = none)
+config_patch_size:          dd 0          ; 0xE4  patch length in bytes (<= 32)
+config_patch_bytes:         times 32 db 0 ; 0xE8  bytes to write
+                            dq 0          ; 0x108 padding -> STUB_CODE_OFFSET=0x110
 
 stub_entry:
     ; Phase 1: capture [rsp] (BTIT+offset) and pristine RSP before any push.
@@ -64,6 +68,9 @@ stub_entry:
     call capture_legit_rtl
 
     call decrypt_all_sections
+    ; Runtime patch (e.g. visible-proof string swap) runs between decrypt
+    ; and import resolve: sections are writable plaintext, IAT is still raw.
+    call apply_runtime_patch
     call resolve_imports
     ; TLS callbacks run AFTER IAT fix-up (MSVC callbacks need UCRT imports).
     call handle_tls_callbacks
@@ -521,6 +528,33 @@ handle_tls_callbacks:
     pop rcx
     pop rbx
     pop rbp
+    ret
+
+
+; apply_runtime_patch() - write config_patch_bytes at (image_base + patch_rva).
+;   Both config_patch_rva == 0 and config_patch_size == 0 mean "nothing to do".
+;   Called AFTER decrypt_all_sections so the target bytes are plaintext.
+apply_runtime_patch:
+    mov ecx, dword [rel config_patch_rva]
+    test ecx, ecx
+    jz .done
+    mov edx, dword [rel config_patch_size]
+    test edx, edx
+    jz .done
+    cmp edx, 32
+    ja .done
+
+    lea rdi, [r12 + rcx]                ; dst = base + patch_rva
+    lea rsi, [rel config_patch_bytes]
+    xor rax, rax
+.copy_loop:
+    cmp rax, rdx
+    jae .done
+    mov r8b, byte [rsi + rax]
+    mov byte [rdi + rax], r8b
+    inc rax
+    jmp .copy_loop
+.done:
     ret
 
 

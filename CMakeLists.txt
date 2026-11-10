@@ -26,3 +26,12 @@ add_executable(packer
 target_include_directories(packer PRIVATE packer)
 
 add_dependencies(packer stub)
+
+# Small test binary used end-to-end to show the runtime patch:
+# unpacked prints "Hello from non-packed", packed prints "Hello from packed".
+add_executable(hello_test tests/hello_test.c)
+set_target_properties(hello_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY         "${CMAKE_BINARY_DIR}/Release"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_BINARY_DIR}/Release"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
+)
