@@ -2,8 +2,6 @@
 
 ASmdead is an educational x64 PE packer. It encrypts a target binary with AES-128-CTR (via AES-NI), then injects a position-independent NASM stub that decrypts in memory, rebuilds the IAT, replays TLS callbacks, pivots onto a synthesized call stack, and jumps to the original entry point. The spoofed stack unwinds cleanly through `ntdll!RtlUserThreadStart` → `kernel32!BaseThreadInitThunk` using return-address offsets captured dynamically from the running process — no hardcoded offsets, no OS-version brittleness.
 
-Built as a side project for a talk at **NullCon Berlin 2026**.
-
 ## Features
 
 - **AES-128-CTR via AES-NI.** Master key and 64-bit nonce are generated per-pack with `rand_s`. Counter block is `nonce || section_rva || block_index`, so no reuse is possible across sections. Key schedule happens inside the stub via `aeskeygenassist`. XOR 1-byte stays available as a fallback (`--algo xor`).
